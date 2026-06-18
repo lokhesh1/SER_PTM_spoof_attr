@@ -1,37 +1,25 @@
 #!/usr/bin/env python3
-"""Modular SER pre-trained-model loader & feature extractor.
+"""SER feature extraction.
 
-Part of the *spoof speech source attribution* project. This module loads a
-Speech-Emotion-Recognition (SER) pre-trained model from Hugging Face *on demand*
-(only the model requested at run time is instantiated) and exposes it for two
-purposes:
+Part of the *spoof speech source attribution* project. Given a model loaded by
+:mod:`model_loader`, this module turns audio into features:
 
-    1. Feature extraction  -- the current task.
-    2. Fine-tuning         -- the underlying ``nn.Module`` is exposed via
-                              ``extractor.model`` together with ``freeze()`` /
-                              ``unfreeze()`` helpers, so the very same object can
-                              be plugged into a training loop later.
-
-Feature extraction supports:
-    * selecting a specific layer / set of layers (``--layers 6 9 12`` or ``all``,
+    * select a specific layer / set of layers (``--layers 6 9 12`` or ``all``,
       negative indices allowed, e.g. ``-1`` = last layer),
     * optional temporal pooling of the requested layers (``--pooling mean|max|
-      mean_std``) -> one vector per layer instead of a (T, D) matrix,
-    * optionally saving the extracted features to disk (``--save``).
+      mean_std``) -> one vector per layer instead of a ``(T, D)`` matrix,
+    * optionally save the extracted features to disk (``--save``).
 
-Two backends are implemented behind a common interface:
-    * ``transformers``  -- WavLM / wav2vec2 / HuBERT etc. Full per-layer access
-                           through ``output_hidden_states=True``.
-    * ``funasr``        -- emotion2vec+. FunASR's high-level API exposes a single
-                           (final) representation; see ``Emotion2vecExtractor``.
+Model *loading* lives in :mod:`model_loader`; this file only handles audio I/O,
+layer selection, pooling, saving and the CLI.
 
 Examples
 --------
-List the models that are registered::
+List registered models::
 
     python ser_feature_extractor.py --list-models
 
-Extract pooled features from the last layer of wavlm-base-emotion and save::
+Extract pooled last-layer features from wavlm-base-emotion and save::
 
     python ser_feature_extractor.py --model wavlm_base_emotion \
         --audio sample1.wav sample2.flac --layers -1 --pooling mean \
@@ -41,10 +29,12 @@ Run with no ``--model`` to be prompted interactively for the model key.
 
 Programmatic use::
 
-    from ser_feature_extractor import load_model, ExtractionConfig
-    extractor = load_model("emotion2vec_plus_large", device="cuda")
-    result = extractor.extract("sample.wav",
-                               ExtractionConfig(layers=[-1], pooling="mean"))
+    from model_loader import load_model
+    from ser_feature_extractor import extract_features, ExtractionConfig
+
+    model = load_model("emotion2vec_plus_large", device="cuda")
+    result = extract_features(model, "sample.wav",
+                              ExtractionConfig(layers=[-1], pooling="mean"))
     vec = result.features[result.final_layer]   # (D,) numpy array
 """
 
@@ -53,78 +43,24 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
+import torch
 
-try:  # torch / torchaudio are required at run time, not import time, for clarity
-    import torch
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "PyTorch is required. Install the project requirements: "
-        "pip install -r requirements.txt"
-    ) from exc
+from model_loader import (
+    BACKEND_CLASSES,
+    MODEL_REGISTRY,
+    TARGET_SAMPLE_RATE,
+    BaseSERModel,
+    load_model,
+)
 
-
-logger = logging.getLogger("ser_feature_extractor")
+logger = logging.getLogger("ser.feature_extractor")
 
 AudioInput = Union[str, Path, np.ndarray, "torch.Tensor"]
-TARGET_SAMPLE_RATE = 16_000  # every registered SER model expects 16 kHz mono
-
-
-# --------------------------------------------------------------------------- #
-# Model registry
-# --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class ModelSpec:
-    """Static description of a registered pre-trained model."""
-
-    key: str
-    backend: str  # "transformers" | "funasr"
-    hf_id: str
-    description: str = ""
-
-
-# Add new models here. ``hf_id`` can always be overridden at load time, so an
-# unregistered checkpoint can still be used via ``load_model(name, hf_id=...)``.
-MODEL_REGISTRY: Dict[str, ModelSpec] = {
-    # --- emotion2vec+ family (FunASR backend) ----------------------------- #
-    "emotion2vec_plus_seed": ModelSpec(
-        "emotion2vec_plus_seed", "funasr",
-        "emotion2vec/emotion2vec_plus_seed",
-        "emotion2vec+ seed checkpoint.",
-    ),
-    "emotion2vec_plus_base": ModelSpec(
-        "emotion2vec_plus_base", "funasr",
-        "emotion2vec/emotion2vec_plus_base",
-        "emotion2vec+ base checkpoint.",
-    ),
-    "emotion2vec_plus_large": ModelSpec(
-        "emotion2vec_plus_large", "funasr",
-        "emotion2vec/emotion2vec_plus_large",
-        "emotion2vec+ large checkpoint.",
-    ),
-    # --- transformers backend (WavLM / wav2vec2 / HuBERT) ----------------- #
-    "wavlm_base_emotion": ModelSpec(
-        "wavlm_base_emotion", "transformers",
-        # Override with --hf-id if you target a different emotion checkpoint.
-        "microsoft/wavlm-base-plus",
-        "WavLM base+ encoder (use --hf-id for an emotion-finetuned variant).",
-    ),
-    "wav2vec2_emotion": ModelSpec(
-        "wav2vec2_emotion", "transformers",
-        "superb/wav2vec2-base-superb-er",
-        "wav2vec2 base fine-tuned for emotion recognition (SUPERB ER).",
-    ),
-    "hubert_emotion": ModelSpec(
-        "hubert_emotion", "transformers",
-        "superb/hubert-large-superb-er",
-        "HuBERT large fine-tuned for emotion recognition (SUPERB ER).",
-    ),
-}
 
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +155,7 @@ def _read_file(path: str):
 
 
 # --------------------------------------------------------------------------- #
-# Pooling & saving helpers
+# Pooling, layer selection & saving
 # --------------------------------------------------------------------------- #
 def pool_over_time(feat: "torch.Tensor", method: str) -> "torch.Tensor":
     """Pool a ``(T, D)`` sequence into a single vector."""
@@ -285,225 +221,50 @@ def save_features(result: FeatureResult, save_dir: Union[str, Path], fmt: str) -
 
 
 # --------------------------------------------------------------------------- #
-# Base extractor
+# Extraction orchestration
 # --------------------------------------------------------------------------- #
-class BaseSERFeatureExtractor(ABC):
-    """Common interface for all SER feature extractors."""
+def extract_features(
+    model: BaseSERModel, audio: AudioInput, config: Optional[ExtractionConfig] = None
+) -> FeatureResult:
+    """Extract layer features from ``audio`` using a loaded ``model``."""
+    config = config or ExtractionConfig()
+    source = str(audio) if isinstance(audio, (str, Path)) else "<array>"
 
-    backend: str = "base"
-
-    def __init__(self, name: str, hf_id: str, device: str = "cpu"):
-        self.name = name
-        self.hf_id = hf_id
-        self.device = device
-        self.model = None  # underlying nn.Module / FunASR AutoModel
-        self._loaded = False
-
-    # -- lifecycle --------------------------------------------------------- #
-    def load(self) -> "BaseSERFeatureExtractor":
-        if not self._loaded:
-            logger.info("Loading %s (%s backend) from '%s' on %s",
-                        self.name, self.backend, self.hf_id, self.device)
-            self._load()
-            self._loaded = True
-        return self
-
-    @abstractmethod
-    def _load(self) -> None:
-        """Instantiate ``self.model`` (and any processor)."""
-
-    @abstractmethod
-    def _forward_layers(self, waveform: "torch.Tensor") -> Dict[int, "torch.Tensor"]:
-        """Run the model and return ``{layer_index: (T, D) tensor}`` for every
-        available layer. Keys must be contiguous starting at 0."""
-
-    # -- feature extraction ------------------------------------------------ #
-    def extract(self, audio: AudioInput, config: Optional[ExtractionConfig] = None) -> FeatureResult:
-        if not self._loaded:
-            self.load()
-        config = config or ExtractionConfig()
-        source = str(audio) if isinstance(audio, (str, Path)) else "<array>"
-
-        waveform = load_audio(audio, TARGET_SAMPLE_RATE)
-        all_layers = self._forward_layers(waveform)
-        chosen = select_layers(all_layers, config.layers)
-        if not chosen:
-            raise RuntimeError(
-                f"No layers selected for {self.name}; requested {config.layers}, "
-                f"available 0..{len(all_layers) - 1}."
-            )
-
-        features: Dict[int, np.ndarray] = {}
-        for idx, feat in chosen.items():
-            if config.pooling is not None:
-                feat = pool_over_time(feat, config.pooling)
-            features[idx] = feat.detach().cpu().numpy()
-
-        result = FeatureResult(
-            model_name=self.name,
-            source=source,
-            features=features,
-            pooled=config.pooling is not None,
-            sample_rate=TARGET_SAMPLE_RATE,
-        )
-        if config.save:
-            result.saved_to = save_features(
-                result, config.save_dir or "features", config.save_format
-            )
-        return result
-
-    def extract_batch(
-        self, audios: Sequence[AudioInput], config: Optional[ExtractionConfig] = None
-    ) -> List[FeatureResult]:
-        return [self.extract(a, config) for a in audios]
-
-    # -- fine-tuning helpers ----------------------------------------------- #
-    def freeze(self) -> None:
-        """Freeze all parameters (feature-extraction / probing setups)."""
-        if hasattr(self.model, "parameters"):
-            for p in self.model.parameters():
-                p.requires_grad = False
-
-    def unfreeze(self) -> None:
-        """Unfreeze all parameters (full fine-tuning)."""
-        if hasattr(self.model, "parameters"):
-            for p in self.model.parameters():
-                p.requires_grad = True
-
-
-# --------------------------------------------------------------------------- #
-# transformers backend (WavLM / wav2vec2 / HuBERT / ...)
-# --------------------------------------------------------------------------- #
-class TransformersSERExtractor(BaseSERFeatureExtractor):
-    backend = "transformers"
-
-    def _load(self) -> None:
-        from transformers import AutoFeatureExtractor, AutoModel
-
-        self.processor = AutoFeatureExtractor.from_pretrained(self.hf_id)
-        # AutoModel loads the base encoder even from a *ForSequenceClassification
-        # checkpoint, which is what we want for per-layer features.
-        self.model = AutoModel.from_pretrained(self.hf_id, output_hidden_states=True)
-        self.model.to(self.device).eval()
-
-    @torch.no_grad()
-    def _forward_layers(self, waveform: "torch.Tensor") -> Dict[int, "torch.Tensor"]:
-        inputs = self.processor(
-            waveform.numpy(), sampling_rate=TARGET_SAMPLE_RATE, return_tensors="pt"
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        outputs = self.model(**inputs)
-        # hidden_states: tuple of (1, T, D); index 0 = embeddings, 1..N = layers.
-        hidden_states = outputs.hidden_states
-        return {i: hs.squeeze(0).cpu() for i, hs in enumerate(hidden_states)}
-
-
-# --------------------------------------------------------------------------- #
-# FunASR backend (emotion2vec+)
-# --------------------------------------------------------------------------- #
-class Emotion2vecExtractor(BaseSERFeatureExtractor):
-    """emotion2vec+ via FunASR.
-
-    NOTE: FunASR's high-level ``generate`` API exposes a single (final)
-    representation rather than every transformer block. We therefore return one
-    layer keyed ``0`` (frame-level, ``(T, D)``). Requesting other layer indices
-    will be skipped with a warning. Per-block extraction would require forward
-    hooks on the encoder and is left as a documented extension point
-    (``_register_layer_hooks``) for the attribution experiments.
-    """
-
-    backend = "funasr"
-
-    def _load(self) -> None:
-        from funasr import AutoModel as FunASRAutoModel
-
-        self.model = FunASRAutoModel(model=self.hf_id, hub="hf", disable_update=True)
-
-    @torch.no_grad()
-    def _forward_layers(self, waveform: "torch.Tensor") -> Dict[int, "torch.Tensor"]:
-        # granularity="frame" -> (T, D); "utterance" would pre-pool. We always
-        # request frame-level and let the common code handle pooling uniformly.
-        results = self.model.generate(
-            waveform.numpy(),
-            granularity="frame",
-            extract_embedding=True,
-        )
-        feats = np.asarray(results[0]["feats"])
-        if feats.ndim == 1:  # defensive: some versions return (D,)
-            feats = feats[None, :]
-        return {0: torch.from_numpy(feats).float()}
-
-    def _register_layer_hooks(self):  # pragma: no cover - extension point
-        """Placeholder for per-block extraction via forward hooks.
-
-        emotion2vec is a data2vec-style encoder; intermediate block outputs can
-        be captured by registering hooks on its transformer layers. Implement
-        here if the attribution study needs layer-wise emotion2vec features.
-        """
-        raise NotImplementedError(
-            "Per-layer emotion2vec extraction is not implemented yet."
+    waveform = load_audio(audio, TARGET_SAMPLE_RATE)
+    all_layers = model.forward_layers(waveform)
+    chosen = select_layers(all_layers, config.layers)
+    if not chosen:
+        raise RuntimeError(
+            f"No layers selected for {model.name}; requested {config.layers}, "
+            f"available 0..{len(all_layers) - 1}."
         )
 
+    features: Dict[int, np.ndarray] = {}
+    for idx, feat in chosen.items():
+        if config.pooling is not None:
+            feat = pool_over_time(feat, config.pooling)
+        features[idx] = feat.detach().cpu().numpy()
 
-BACKEND_CLASSES = {
-    "transformers": TransformersSERExtractor,
-    "funasr": Emotion2vecExtractor,
-}
-
-
-# --------------------------------------------------------------------------- #
-# Factory
-# --------------------------------------------------------------------------- #
-def load_model(
-    name: str,
-    device: str = "auto",
-    hf_id: Optional[str] = None,
-    backend: Optional[str] = None,
-) -> BaseSERFeatureExtractor:
-    """Instantiate and load the requested model (and only that one).
-
-    Parameters
-    ----------
-    name:
-        A key from :data:`MODEL_REGISTRY`, or an arbitrary identifier when also
-        passing ``hf_id`` (and ``backend`` for non-transformers models).
-    device:
-        ``"auto"`` (default), ``"cpu"``, ``"cuda"``, ``"cuda:0"`` ...
-    hf_id:
-        Override the Hugging Face repo id for the chosen key, or supply the repo
-        id for an unregistered model.
-    backend:
-        Required when ``name`` is unregistered and not transformers-based.
-    """
-    device = _resolve_device(device)
-    spec = MODEL_REGISTRY.get(name)
-    if spec is not None:
-        resolved_backend = backend or spec.backend
-        resolved_hf_id = hf_id or spec.hf_id
-    else:
-        if hf_id is None:
-            raise KeyError(
-                f"Unknown model '{name}'. Choose one of {sorted(MODEL_REGISTRY)} "
-                f"or pass hf_id=... to use an unregistered checkpoint."
-            )
-        resolved_backend = backend or "transformers"
-        resolved_hf_id = hf_id
-        logger.info("Using unregistered model '%s' (%s).", name, resolved_hf_id)
-
-    if resolved_backend not in BACKEND_CLASSES:
-        raise ValueError(
-            f"Unknown backend '{resolved_backend}'. Known: {sorted(BACKEND_CLASSES)}"
-        )
-    extractor = BACKEND_CLASSES[resolved_backend](
-        name=name, hf_id=resolved_hf_id, device=device
+    result = FeatureResult(
+        model_name=model.name,
+        source=source,
+        features=features,
+        pooled=config.pooling is not None,
+        sample_rate=TARGET_SAMPLE_RATE,
     )
-    return extractor.load()
+    if config.save:
+        result.saved_to = save_features(
+            result, config.save_dir or "features", config.save_format
+        )
+    return result
 
 
-def _resolve_device(device: str) -> str:
-    if device == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    return device
+def extract_batch(
+    model: BaseSERModel,
+    audios: Sequence[AudioInput],
+    config: Optional[ExtractionConfig] = None,
+) -> List[FeatureResult]:
+    return [extract_features(model, a, config) for a in audios]
 
 
 # --------------------------------------------------------------------------- #
@@ -538,7 +299,7 @@ def _prompt_for_model() -> str:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Load an SER pre-trained model and extract layer features.",
+        description="Extract SER layer features from audio.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--model", help="Registered model key (prompted if omitted).")
@@ -572,7 +333,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     model_key = args.model or _prompt_for_model()
-    extractor = load_model(
+    model = load_model(
         model_key, device=args.device, hf_id=args.hf_id, backend=args.backend
     )
 
@@ -588,7 +349,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         save_format=args.save_format,
     )
     for audio_path in args.audio:
-        result = extractor.extract(audio_path, config)
+        result = extract_features(model, audio_path, config)
         shapes = {idx: tuple(arr.shape) for idx, arr in sorted(result.features.items())}
         logger.info(
             "%s -> layers %s | pooled=%s%s",
