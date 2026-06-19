@@ -191,12 +191,19 @@ class TransformersSERModel(BaseSERModel):
 class Emotion2vecModel(BaseSERModel):
     """emotion2vec+ via FunASR, loaded from the Hugging Face mirror.
 
-    NOTE: FunASR's high-level ``generate`` API exposes a single (final)
-    representation rather than every transformer block. We therefore return one
-    layer keyed ``0`` (frame-level, ``(T, D)``). Requesting other layer indices
-    will be skipped with a warning. Per-block extraction would require forward
-    hooks on the encoder and is left as a documented extension point
-    (``_register_layer_hooks``) for the attribution experiments.
+    FunASR's high-level ``generate`` API only returns a single (final)
+    representation, but the underlying data2vec-style encoder computes a hidden
+    state per transformer block. We surface all of them by registering forward
+    hooks on ``model.model.blocks`` and tapping them during a normal
+    ``generate(...)`` call -- this reuses FunASR's own preprocessing instead of
+    reimplementing it.
+
+    Layer indexing matches the transformers backend: ``0`` is the encoder's
+    input embedding (the tensor fed to the first block) and ``1..N`` are the
+    outputs of the N transformer blocks.
+
+    If the encoder structure can't be located (FunASR version differences), we
+    fall back to the single final ``feats`` representation keyed ``0``.
     """
 
     backend = "funasr"
@@ -207,31 +214,76 @@ class Emotion2vecModel(BaseSERModel):
         # hub="hf" -> download from Hugging Face (emotion2vec/...). Switch to
         # hub="ms" with an "iic/..." id to use the ModelScope mirror instead.
         self.model = FunASRAutoModel(model=self.hf_id, hub="hf", disable_update=True)
+        self._blocks = self._locate_blocks()
+        if self._blocks is None:
+            logger.warning(
+                "Could not locate emotion2vec transformer blocks; per-layer "
+                "extraction is unavailable and only the final representation "
+                "(layer 0) will be returned."
+            )
+
+    def _locate_blocks(self):
+        """Return the ``ModuleList`` of transformer blocks, or ``None``."""
+        inner = getattr(self.model, "model", None)
+        blocks = getattr(inner, "blocks", None)
+        if blocks is not None and len(blocks) > 0:
+            return blocks
+        return None
 
     @torch.no_grad()
     def forward_layers(self, waveform: "torch.Tensor") -> Dict[int, "torch.Tensor"]:
-        # granularity="frame" -> (T, D); "utterance" would pre-pool. We always
-        # request frame-level and let the caller handle pooling uniformly.
-        results = self.model.generate(
-            waveform.numpy(),
-            granularity="frame",
-            extract_embedding=True,
-        )
+        captured: Dict[int, "torch.Tensor"] = {}
+        handles = []
+
+        if self._blocks is not None:
+            # Pre-hook on block 0 captures the input embeddings -> layer 0.
+            def pre_hook(_module, args):
+                captured[0] = args[0].detach().clone()
+
+            handles.append(self._blocks[0].register_forward_pre_hook(pre_hook))
+
+            # Forward hook on each block captures its output -> layers 1..N.
+            def make_hook(layer_idx: int):
+                def hook(_module, _args, output):
+                    out = output[0] if isinstance(output, (tuple, list)) else output
+                    captured[layer_idx] = out.detach().clone()
+                return hook
+
+            for i, block in enumerate(self._blocks):
+                handles.append(block.register_forward_hook(make_hook(i + 1)))
+
+        try:
+            # granularity="frame" -> frame-level; hooks fire during this call.
+            results = self.model.generate(
+                waveform.numpy(),
+                granularity="frame",
+                extract_embedding=True,
+            )
+        finally:
+            for h in handles:
+                h.remove()
+
+        if captured:
+            return {idx: self._to_time_dim(t) for idx, t in sorted(captured.items())}
+
+        # Fallback: high-level final feature only.
         feats = np.asarray(results[0]["feats"])
         if feats.ndim == 1:  # defensive: some versions return (D,)
             feats = feats[None, :]
         return {0: torch.from_numpy(feats).float()}
 
-    def _register_layer_hooks(self):  # pragma: no cover - extension point
-        """Placeholder for per-block extraction via forward hooks.
-
-        emotion2vec is a data2vec-style encoder; intermediate block outputs can
-        be captured by registering hooks on its transformer layers. Implement
-        here if the attribution study needs layer-wise emotion2vec features.
-        """
-        raise NotImplementedError(
-            "Per-layer emotion2vec extraction is not implemented yet."
-        )
+    @staticmethod
+    def _to_time_dim(t: "torch.Tensor") -> "torch.Tensor":
+        """Collapse a block tensor to ``(T, D)``, dropping the singleton batch."""
+        t = t.detach().cpu().float()
+        if t.ndim == 3:  # (B, T, C) or (T, B, C) with batch size 1
+            if t.shape[0] == 1:
+                t = t[0]
+            elif t.shape[1] == 1:
+                t = t[:, 0]
+            else:  # unexpected; flatten leading dims onto time
+                t = t.reshape(-1, t.shape[-1])
+        return t
 
 
 BACKEND_CLASSES = {

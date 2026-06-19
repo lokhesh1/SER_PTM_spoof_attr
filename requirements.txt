@@ -1,0 +1,13 @@
+# Core
+torch>=2.1
+torchaudio>=2.1
+numpy>=1.24
+
+# transformers backend (WavLM / wav2vec2 / HuBERT)
+transformers>=4.40
+
+# funasr backend (emotion2vec+) -- pulls in modelscope
+funasr>=1.1.0
+
+# audio I/O fallback when a torchaudio backend is unavailable
+soundfile>=0.12
