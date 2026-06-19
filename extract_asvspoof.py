@@ -19,25 +19,42 @@ The CM protocol is the source of truth for the file list *and* the labels:
 so each saved row carries its attack system id (A01-A06) / ``bonafide`` -- the
 target for source attribution.
 
-Output (per model ``<m>``, in ``--out-dir``)::
+Output (per model ``<m>``, in ``--out-dir``). Default ``--layout per-layer``
+writes one self-contained file per layer so per-layer training loads exactly
+one file::
 
-    asvspoof_la_train__<m>__mean_std.npz
-        ids      : (N,)  utterance ids        (e.g. LA_T_1138215)
-        labels   : (N,)  bonafide | spoof
-        attacks  : (N,)  A01..A06 | bonafide   (attribution target)
-        speakers : (N,)  speaker ids
-        layers   : (L,)  layer indices present (e.g. 0..12)
-        layer_0 .. layer_L : (N, P)  pooled features, P = pool_dim * D
+    asvspoof_la_train__<m>__mean_std/
+        layer_00.npz, layer_01.npz, ...   # each:
+            features : (N, P)  pooled features, P = pool_dim * D
+            layer    : ()      this layer's index
+            ids      : (N,)    utterance ids   (e.g. LA_T_1138215)
+            labels   : (N,)    bonafide | spoof
+            attacks  : (N,)    A01..A06 | bonafide   (attribution target)
+            speakers : (N,)    speaker ids
+
+``--layout consolidated`` instead writes a single ``<base>.npz`` holding
+``layer_0 .. layer_L`` members plus the shared ids/labels/attacks/speakers
+(still lazily loadable one layer at a time: ``np.load(f)["layer_6"]``).
+
+Train on a single layer::
+
+    import numpy as np
+    d = np.load("features_asvspoof_train/asvspoof_la_train__wavlm_base_emotion__mean_std/layer_06.npz")
+    X, y = d["features"], d["attacks"]      # (N, 1536), (N,) in {bonafide, A01..A06}
 
 Examples
 --------
-Both target models, defaults (mean_std, float32, all layers)::
+Both target models, defaults (per-layer, mean pooling -> 768 dim, float32)::
 
     python extract_asvspoof.py --data-root /home/hp/Desktop/Spoof_source_attr/LA
 
 Smoke-test on 50 utterances first::
 
     python extract_asvspoof.py --data-root .../LA --limit 50 --out-dir feats_test
+
+All layers in one file per model instead::
+
+    python extract_asvspoof.py --data-root .../LA --layout consolidated
 """
 
 from __future__ import annotations
@@ -52,7 +69,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from model_loader import load_model
+from model_loader import configure_logging, load_model
 from ser_feature_extractor import ExtractionConfig, extract_features
 
 logger = logging.getLogger("ser.extract_asvspoof")
@@ -60,9 +77,15 @@ logger = logging.getLogger("ser.extract_asvspoof")
 # Default models for this study: WavLM-base-emotion + emotion2vec+ base.
 DEFAULT_MODELS = ["wavlm_base_emotion", "emotion2vec_plus_base"]
 
-# Layout relative to the LA data root (the standard ASVspoof2019 LA release).
-TRAIN_FLAC_SUBDIR = "ASVspoof2019_LA_train/flac"
-TRAIN_PROTOCOL_SUBDIR = "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trn.txt"
+# Subset -> (flac subdir, CM protocol filename) under <data-root>, for the
+# standard ASVspoof2019 LA release. train/dev share attacks A01-A06; eval uses
+# the disjoint A07-A19. (train protocol is .trn.txt; dev/eval are .trl.txt.)
+PROTOCOL_DIR = "ASVspoof2019_LA_cm_protocols"
+SUBSETS: Dict[str, tuple] = {
+    "train": ("ASVspoof2019_LA_train/flac", "ASVspoof2019.LA.cm.train.trn.txt"),
+    "dev":   ("ASVspoof2019_LA_dev/flac",   "ASVspoof2019.LA.cm.dev.trl.txt"),
+    "eval":  ("ASVspoof2019_LA_eval/flac",  "ASVspoof2019.LA.cm.eval.trl.txt"),
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -103,19 +126,45 @@ def read_protocol(protocol_path: Path) -> List[Utt]:
 # --------------------------------------------------------------------------- #
 # Per-model extraction
 # --------------------------------------------------------------------------- #
+def model_output_base(
+    out_dir: Path, subset: str, model_key: str, pooling: Optional[str]
+) -> Path:
+    """Extension-less base path for a (subset, model) output (a ``.npz`` file or
+    a directory, depending on the chosen layout)."""
+    return Path(out_dir) / f"asvspoof_la_{subset}__{model_key}__{pooling}"
+
+
+def output_exists(base: Path, layout: str) -> bool:
+    """Whether a previous run already produced this model's output."""
+    if layout == "consolidated":
+        return Path(f"{base}.npz").exists()
+    return base.is_dir() and any(base.glob("layer_*.npz"))
+
+
 def extract_model(
     model_key: str,
     utts: Sequence[Utt],
     flac_dir: Path,
-    out_path: Path,
+    out_dir: Path,
     *,
     config: ExtractionConfig,
     dtype: str,
     device: str,
+    layout: str,
     log_every: int,
 ) -> None:
-    """Extract pooled all-layer features for ``utts`` with one model and save."""
-    logger.info("=== %s -> %s ===", model_key, out_path)
+    """Extract pooled all-layer features for ``utts`` with one model and save.
+
+    ``layout`` controls the on-disk shape:
+      * ``"per-layer"``  -> a directory ``<base>/`` with one self-contained
+        ``layer_KK.npz`` per layer (each carries ``features`` + the shared
+        ``ids/labels/attacks/speakers``), so training on a single layer means
+        loading exactly one file.
+      * ``"consolidated"`` -> a single ``<base>.npz`` with ``layer_K`` members
+        (still lazily loadable one layer at a time via ``np.load(f)["layer_6"]``).
+    """
+    base = model_output_base(out_dir, model_key, config.pooling)
+    logger.info("=== %s -> %s ===", model_key, base)
     model = load_model(model_key, device=device)
 
     n = len(utts)
@@ -184,30 +233,47 @@ def extract_model(
         logger.error("%s: no features extracted; nothing saved.", model_key)
         return
 
-    # Trim pre-allocated rows down to what was actually filled (skips/failures).
-    arrays = {f"layer_{k}": buffers[k][:w] for k in layer_keys}
-    meta = {
+    # Labels/ids shared by every layer (trimmed to the rows actually filled).
+    label_meta = {
         "ids": np.asarray(ids),
         "speakers": np.asarray(speakers),
         "attacks": np.asarray(attacks),
         "labels": np.asarray(labels),
-        "layers": np.asarray(layer_keys, dtype=np.int64),
+    }
+    info = {
         "model": np.asarray(model_key),
         "pooling": np.asarray(str(config.pooling)),
         "dtype": np.asarray(dtype),
     }
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out_path, **arrays, **meta)
+    if layout == "consolidated":
+        out_path = Path(f"{base}.npz")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        arrays = {f"layer_{k}": buffers[k][:w] for k in layer_keys}
+        np.savez(out_path, **arrays, **label_meta,
+                 layers=np.asarray(layer_keys, dtype=np.int64), **info)
+        saved = [out_path]
+        target = out_path
+    else:  # per-layer: one self-contained file per layer
+        layer_dir = Path(base)
+        layer_dir.mkdir(parents=True, exist_ok=True)
+        saved = []
+        for k in layer_keys:
+            lp = layer_dir / f"layer_{k:02d}.npz"
+            np.savez(lp, features=buffers[k][:w], layer=np.asarray(k),
+                     **label_meta, **info)
+            saved.append(lp)
+        target = layer_dir
 
-    size_gib = out_path.stat().st_size / 2**30
+    total_gib = sum(p.stat().st_size for p in saved) / 2**30
     logger.info(
-        "Saved %s: %d utts, %d layers, %s float -> %s (%.2f GiB)%s",
-        model_key, w, len(layer_keys), dtype, out_path, size_gib,
+        "Saved %s: %d utts, %d layers (%s), %s float -> %s (%.2f GiB)%s",
+        model_key, w, len(layer_keys), layout, dtype, target, total_gib,
         f", {len(failed)} failed" if failed else "",
     )
     if failed:
-        fail_log = out_path.with_suffix(".failed.txt")
+        fail_log = Path(f"{base}.failed.txt")
+        fail_log.parent.mkdir(parents=True, exist_ok=True)
         fail_log.write_text("\n".join(failed) + "\n", encoding="utf-8")
         logger.info("Wrote %d failed ids -> %s", len(failed), fail_log)
 
@@ -242,12 +308,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Layer indices to keep (e.g. 0 6 12) or omit for ALL layers.",
     )
     p.add_argument(
-        "--pooling", choices=["mean", "max", "mean_std"], default="mean_std",
-        help="Temporal pooling applied to every layer.",
+        "--pooling", choices=["mean", "max", "mean_std"], default="mean",
+        help="Temporal pooling applied to every layer. 'mean'/'max' keep the "
+             "native hidden dim (768); 'mean_std' concatenates mean+std (1536).",
     )
     p.add_argument(
         "--dtype", choices=["float16", "float32"], default="float32",
         help="On-disk numeric precision for the feature arrays.",
+    )
+    p.add_argument(
+        "--layout", choices=["per-layer", "consolidated"], default="per-layer",
+        help="per-layer: one self-contained file per layer (best for per-layer "
+             "training). consolidated: all layers in one .npz per model.",
     )
     p.add_argument("--out-dir", default="features_asvspoof_train", help="Output directory.")
     p.add_argument("--device", default="auto", help="auto | cpu | cuda | cuda:0 ...")
@@ -260,10 +332,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(verbose=args.verbose)
 
     data_root = Path(args.data_root)
     flac_dir = Path(args.flac_dir) if args.flac_dir else data_root / TRAIN_FLAC_SUBDIR
@@ -291,14 +360,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     config = ExtractionConfig(layers=layers, pooling=args.pooling, save=False)
 
     for model_key in args.models:
-        out_path = out_dir / f"asvspoof_la_train__{model_key}__{args.pooling}.npz"
-        if out_path.exists() and not args.overwrite:
-            logger.info("Exists, skipping (use --overwrite): %s", out_path)
+        base = model_output_base(out_dir, model_key, args.pooling)
+        if output_exists(base, args.layout) and not args.overwrite:
+            logger.info("Exists, skipping (use --overwrite): %s", base)
             continue
         extract_model(
-            model_key, utts, flac_dir, out_path,
+            model_key, utts, flac_dir, out_dir,
             config=config, dtype=args.dtype, device=args.device,
-            log_every=args.log_every,
+            layout=args.layout, log_every=args.log_every,
         )
 
     logger.info("Done.")

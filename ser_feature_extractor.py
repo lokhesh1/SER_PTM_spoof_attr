@@ -55,6 +55,7 @@ from model_loader import (
     MODEL_REGISTRY,
     TARGET_SAMPLE_RATE,
     BaseSERModel,
+    configure_logging,
     load_model,
 )
 
@@ -140,18 +141,24 @@ def load_audio(audio: AudioInput, target_sr: int = TARGET_SAMPLE_RATE) -> "torch
 
 
 def _read_file(path: str):
-    """Load an audio file, preferring torchaudio with a soundfile fallback."""
+    """Load an audio file, preferring soundfile (libsndfile) with a torchaudio
+    fallback.
+
+    soundfile reads FLAC/WAV/OGG natively and needs no FFmpeg, so it covers the
+    whole ASVspoof corpus without the torchaudio/torchcodec backend dance.
+    torchaudio is kept only for formats libsndfile can't decode (e.g. mp3/m4a).
+    """
     try:
+        import soundfile as sf
+
+        data, sr = sf.read(path, dtype="float32", always_2d=True)  # (samples, ch)
+        return torch.from_numpy(data.T), sr  # -> (channels, samples)
+    except Exception as exc:  # pragma: no cover - depends on installed backends
+        logger.debug("soundfile.read failed (%s); falling back to torchaudio", exc)
         import torchaudio
 
         waveform, sr = torchaudio.load(path)  # (channels, samples)
         return waveform, sr
-    except Exception as exc:  # pragma: no cover - depends on installed backends
-        logger.debug("torchaudio.load failed (%s); falling back to soundfile", exc)
-        import soundfile as sf
-
-        data, sr = sf.read(path, dtype="float32", always_2d=True)  # (samples, ch)
-        return torch.from_numpy(data.T), sr
 
 
 # --------------------------------------------------------------------------- #
@@ -323,10 +330,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(verbose=args.verbose)
 
     if args.list_models:
         _print_models()

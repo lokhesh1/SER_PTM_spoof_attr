@@ -27,7 +27,10 @@ Use :func:`load_model` to obtain a ready model::
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, Optional
@@ -46,6 +49,64 @@ except ImportError as exc:  # pragma: no cover
 logger = logging.getLogger("ser.model_loader")
 
 TARGET_SAMPLE_RATE = 16_000  # every registered SER model expects 16 kHz mono
+
+
+# --------------------------------------------------------------------------- #
+# Logging / noise control
+# --------------------------------------------------------------------------- #
+# Third-party loggers (and bare ``logging.info`` calls -> the "root" logger)
+# that flood the console during model download / checkpoint load. We keep their
+# WARNING+ records but mute the INFO/DEBUG chatter.
+_NOISY_LOGGERS = (
+    "root", "funasr", "modelscope", "httpx", "httpcore", "urllib3",
+    "filelock", "datasets", "huggingface_hub", "numba", "jieba",
+    "matplotlib", "torio", "torchaudio",
+)
+
+
+class _MuteThirdParty(logging.Filter):
+    """Drop sub-WARNING records from noisy third-party / root loggers, while
+    letting this project's own ``ser.*`` logs through unchanged."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        return record.name.split(".", 1)[0] not in _NOISY_LOGGERS
+
+
+def configure_logging(verbose: bool = False) -> None:
+    """Install a single, filtered stderr handler.
+
+    Our ``ser.*`` loggers report at INFO (or DEBUG with ``verbose``); funasr /
+    HF / modelscope import & download chatter is muted below WARNING. Also
+    disables the Hugging Face download progress bars. Safe to call once from a
+    CLI entry point; replaces any pre-existing root handlers so later
+    ``basicConfig`` calls by third-party libs become no-ops.
+    """
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    # Silences the transformers 5.x "LOAD REPORT" block printed when the
+    # classifier head is dropped from a *ForSequenceClassification checkpoint.
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    handler.addFilter(_MuteThirdParty())
+
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(logging.INFO)
+    logging.getLogger("ser").setLevel(logging.DEBUG if verbose else logging.INFO)
+
+
+@contextlib.contextmanager
+def _suppress_stdout():
+    """Swallow stdout ``print`` noise (e.g. funasr's "miss key in ckpt"
+    warnings) without hiding stderr or exceptions."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        yield
 
 
 # --------------------------------------------------------------------------- #
@@ -213,7 +274,10 @@ class Emotion2vecModel(BaseSERModel):
 
         # hub="hf" -> download from Hugging Face (emotion2vec/...). Switch to
         # hub="ms" with an "iic/..." id to use the ModelScope mirror instead.
-        self.model = FunASRAutoModel(model=self.hf_id, hub="hf", disable_update=True)
+        # _suppress_stdout swallows funasr's "miss key in ckpt" print spam (the
+        # data2vec decoder weights are absent by design -- encoder-only model).
+        with _suppress_stdout():
+            self.model = FunASRAutoModel(model=self.hf_id, hub="hf", disable_update=True)
         self._blocks = self._locate_blocks()
         if self._blocks is None:
             logger.warning(
@@ -254,10 +318,13 @@ class Emotion2vecModel(BaseSERModel):
 
         try:
             # granularity="frame" -> frame-level; hooks fire during this call.
+            # disable_pbar silences funasr's per-utterance tqdm bar (one bar per
+            # file would be 25k bars over the full train set).
             results = self.model.generate(
                 waveform.numpy(),
                 granularity="frame",
                 extract_embedding=True,
+                disable_pbar=True,
             )
         finally:
             for h in handles:
