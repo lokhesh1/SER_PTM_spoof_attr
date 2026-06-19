@@ -23,9 +23,9 @@ Output (per model ``<m>``, in ``--out-dir``). Default ``--layout per-layer``
 writes one self-contained file per layer so per-layer training loads exactly
 one file::
 
-    asvspoof_la_train__<m>__mean_std/
+    asvspoof_la_<subset>__<m>__<pooling>/         # <subset> in {train,dev,eval}
         layer_00.npz, layer_01.npz, ...   # each:
-            features : (N, P)  pooled features, P = pool_dim * D
+            features : (N, P)  pooled features, P = pool_dim * D (mean -> D)
             layer    : ()      this layer's index
             ids      : (N,)    utterance ids   (e.g. LA_T_1138215)
             labels   : (N,)    bonafide | spoof
@@ -39,14 +39,18 @@ one file::
 Train on a single layer::
 
     import numpy as np
-    d = np.load("features_asvspoof_train/asvspoof_la_train__wavlm_base_emotion__mean_std/layer_06.npz")
-    X, y = d["features"], d["attacks"]      # (N, 1536), (N,) in {bonafide, A01..A06}
+    d = np.load("features_asvspoof_train/asvspoof_la_train__wavlm_base_emotion__mean/layer_06.npz")
+    X, y = d["features"], d["attacks"]      # (N, 768), (N,) in {bonafide, A01..A06}
 
 Examples
 --------
-Both target models, defaults (per-layer, mean pooling -> 768 dim, float32)::
+Both target models, defaults (train only, per-layer, mean -> 768 dim, float32)::
 
     python extract_asvspoof.py --data-root /home/hp/Desktop/Spoof_source_attr/LA
+
+Include the dev subset too (dev shares attacks A01-A06 with train)::
+
+    python extract_asvspoof.py --data-root .../LA --subset train dev
 
 Smoke-test on 50 utterances first::
 
@@ -143,6 +147,7 @@ def output_exists(base: Path, layout: str) -> bool:
 
 def extract_model(
     model_key: str,
+    subset: str,
     utts: Sequence[Utt],
     flac_dir: Path,
     out_dir: Path,
@@ -163,8 +168,8 @@ def extract_model(
       * ``"consolidated"`` -> a single ``<base>.npz`` with ``layer_K`` members
         (still lazily loadable one layer at a time via ``np.load(f)["layer_6"]``).
     """
-    base = model_output_base(out_dir, model_key, config.pooling)
-    logger.info("=== %s -> %s ===", model_key, base)
+    base = model_output_base(out_dir, subset, model_key, config.pooling)
+    logger.info("=== [%s] %s -> %s ===", subset, model_key, base)
     model = load_model(model_key, device=device)
 
     n = len(utts)
@@ -283,21 +288,28 @@ def extract_model(
 # --------------------------------------------------------------------------- #
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Extract all-layer SER features over ASVspoof2019 LA train.",
+        description="Extract all-layer SER features over ASVspoof2019 LA "
+                    "(train by default; add dev/eval via --subset).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
         "--data-root", required=True,
-        help="ASVspoof2019 LA root containing ASVspoof2019_LA_train/ and "
-             "ASVspoof2019_LA_cm_protocols/.",
+        help="ASVspoof2019 LA root containing ASVspoof2019_LA_{train,dev,eval}/ "
+             "and ASVspoof2019_LA_cm_protocols/.",
+    )
+    p.add_argument(
+        "--subset", nargs="+", choices=list(SUBSETS), default=["train"],
+        help="Which subset(s) to extract. Default: train only. "
+             "Pass e.g. '--subset train dev' to include dev.",
     )
     p.add_argument(
         "--flac-dir", default=None,
-        help=f"Override flac dir (default <data-root>/{TRAIN_FLAC_SUBDIR}).",
+        help="Override flac dir (requires a single --subset; "
+             "default <data-root>/ASVspoof2019_LA_<subset>/flac).",
     )
     p.add_argument(
         "--protocol", default=None,
-        help=f"Override CM protocol (default <data-root>/{TRAIN_PROTOCOL_SUBDIR}).",
+        help="Override CM protocol path (requires a single --subset).",
     )
     p.add_argument(
         "--models", nargs="+", default=DEFAULT_MODELS,
@@ -335,40 +347,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     configure_logging(verbose=args.verbose)
 
     data_root = Path(args.data_root)
-    flac_dir = Path(args.flac_dir) if args.flac_dir else data_root / TRAIN_FLAC_SUBDIR
-    protocol = Path(args.protocol) if args.protocol else data_root / TRAIN_PROTOCOL_SUBDIR
     out_dir = Path(args.out_dir)
+    subsets = args.subset
 
-    for path, what in [(flac_dir, "flac dir"), (protocol, "protocol")]:
-        if not path.exists():
-            logger.error("%s not found: %s", what, path)
-            return 2
+    if (args.flac_dir or args.protocol) and len(subsets) != 1:
+        logger.error(
+            "--flac-dir/--protocol overrides require exactly one --subset; got %s",
+            subsets,
+        )
+        return 2
 
-    utts = read_protocol(protocol)
-    if args.limit:
-        utts = utts[: args.limit]
-    n_bona = sum(u.label == "bonafide" for u in utts)
-    logger.info(
-        "Loaded %d utts from %s (%d bonafide, %d spoof). Models: %s",
-        len(utts), protocol.name, n_bona, len(utts) - n_bona, args.models,
-    )
-
-    layers = None
-    if args.layers:
-        layers = [int(x) for x in args.layers]
-
+    layers = [int(x) for x in args.layers] if args.layers else None
     config = ExtractionConfig(layers=layers, pooling=args.pooling, save=False)
 
-    for model_key in args.models:
-        base = model_output_base(out_dir, model_key, args.pooling)
-        if output_exists(base, args.layout) and not args.overwrite:
-            logger.info("Exists, skipping (use --overwrite): %s", base)
-            continue
-        extract_model(
-            model_key, utts, flac_dir, out_dir,
-            config=config, dtype=args.dtype, device=args.device,
-            layout=args.layout, log_every=args.log_every,
+    for subset in subsets:
+        flac_subdir, proto_name = SUBSETS[subset]
+        flac_dir = Path(args.flac_dir) if args.flac_dir else data_root / flac_subdir
+        protocol = (
+            Path(args.protocol) if args.protocol
+            else data_root / PROTOCOL_DIR / proto_name
         )
+
+        missing = [str(p) for p in (flac_dir, protocol) if not p.exists()]
+        if missing:
+            logger.error("[%s] not found, skipping subset: %s", subset, missing)
+            continue
+
+        utts = read_protocol(protocol)
+        if args.limit:
+            utts = utts[: args.limit]
+        n_bona = sum(u.label == "bonafide" for u in utts)
+        logger.info(
+            "[%s] Loaded %d utts from %s (%d bonafide, %d spoof). Models: %s",
+            subset, len(utts), protocol.name, n_bona, len(utts) - n_bona, args.models,
+        )
+
+        for model_key in args.models:
+            base = model_output_base(out_dir, subset, model_key, args.pooling)
+            if output_exists(base, args.layout) and not args.overwrite:
+                logger.info("Exists, skipping (use --overwrite): %s", base)
+                continue
+            extract_model(
+                model_key, subset, utts, flac_dir, out_dir,
+                config=config, dtype=args.dtype, device=args.device,
+                layout=args.layout, log_every=args.log_every,
+            )
 
     logger.info("Done.")
     return 0
