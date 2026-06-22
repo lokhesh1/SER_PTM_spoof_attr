@@ -131,11 +131,17 @@ def read_protocol(protocol_path: Path) -> List[Utt]:
 # Per-model extraction
 # --------------------------------------------------------------------------- #
 def model_output_base(
-    out_dir: Path, subset: str, model_key: str, pooling: Optional[str]
+    out_dir: Path, subset: str, model_key: str, pooling: Optional[str],
+    extract_cnn: bool = False,
 ) -> Path:
     """Extension-less base path for a (subset, model) output (a ``.npz`` file or
-    a directory, depending on the chosen layout)."""
-    return Path(out_dir) / f"asvspoof_la_{subset}__{model_key}__{pooling}"
+    a directory, depending on the chosen layout).
+
+    CNN-layer runs get a ``__cnn`` suffix so their conv/early-transformer
+    features never collide with (or get skipped by) a full transformer-layer run
+    in the same ``--out-dir``."""
+    suffix = "__cnn" if extract_cnn else ""
+    return Path(out_dir) / f"asvspoof_la_{subset}__{model_key}__{pooling}{suffix}"
 
 
 def output_exists(base: Path, layout: str) -> bool:
@@ -157,6 +163,7 @@ def extract_model(
     device: str,
     layout: str,
     log_every: int,
+    extract_cnn: bool = False,
 ) -> None:
     """Extract pooled all-layer features for ``utts`` with one model and save.
 
@@ -168,9 +175,9 @@ def extract_model(
       * ``"consolidated"`` -> a single ``<base>.npz`` with ``layer_K`` members
         (still lazily loadable one layer at a time via ``np.load(f)["layer_6"]``).
     """
-    base = model_output_base(out_dir, subset, model_key, config.pooling)
+    base = model_output_base(out_dir, subset, model_key, config.pooling, extract_cnn)
     logger.info("=== [%s] %s -> %s ===", subset, model_key, base)
-    model = load_model(model_key, device=device)
+    model = load_model(model_key, device=device, extract_cnn=extract_cnn)
 
     n = len(utts)
     # Pre-allocated per-layer arrays, sized on the first successful utterance
@@ -264,7 +271,10 @@ def extract_model(
         layer_dir.mkdir(parents=True, exist_ok=True)
         saved = []
         for k in layer_keys:
-            lp = layer_dir / f"layer_{k:02d}.npz"
+            # int keys -> zero-padded layer_06.npz; CNN-mode string keys
+            # (cnn_0/tf_0) are used verbatim -> layer_cnn_0.npz / layer_tf_0.npz.
+            name = f"layer_{k:02d}" if isinstance(k, int) else f"layer_{k}"
+            lp = layer_dir / f"{name}.npz"
             np.savez(lp, features=buffers[k][:w], layer=np.asarray(k),
                      **label_meta, **info)
             saved.append(lp)
@@ -317,7 +327,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--layers", nargs="+", default=None,
-        help="Layer indices to keep (e.g. 0 6 12) or omit for ALL layers.",
+        help="Layer indices to keep (e.g. 0 6 12) or omit for ALL layers. "
+             "Ignored when --cnn-layers is set.",
+    )
+    p.add_argument(
+        "--cnn-layers", action="store_true",
+        help="Extract every CNN feature-encoder layer (cnn_0..cnn_N) plus the "
+             "first three hidden states (tf_0/tf_1/tf_2 = input embedding + "
+             "transformer blocks 1-2) instead of all transformer layers. "
+             "transformers backend only (WavLM / HuBERT / wav2vec2). Output dir "
+             "gets a __cnn suffix.",
     )
     p.add_argument(
         "--pooling", choices=["mean", "max", "mean_std"], default="mean",
@@ -358,6 +377,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     layers = [int(x) for x in args.layers] if args.layers else None
+    if args.cnn_layers and layers is not None:
+        logger.warning("--cnn-layers ignores --layers; extracting all cnn_*/tf_* keys.")
+        layers = None
     config = ExtractionConfig(layers=layers, pooling=args.pooling, save=False)
 
     for subset in subsets:
@@ -383,7 +405,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
         for model_key in args.models:
-            base = model_output_base(out_dir, subset, model_key, args.pooling)
+            base = model_output_base(out_dir, subset, model_key, args.pooling,
+                                     args.cnn_layers)
             if output_exists(base, args.layout) and not args.overwrite:
                 logger.info("Exists, skipping (use --overwrite): %s", base)
                 continue
@@ -391,6 +414,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 model_key, subset, utts, flac_dir, out_dir,
                 config=config, dtype=args.dtype, device=args.device,
                 layout=args.layout, log_every=args.log_every,
+                extract_cnn=args.cnn_layers,
             )
 
     logger.info("Done.")
