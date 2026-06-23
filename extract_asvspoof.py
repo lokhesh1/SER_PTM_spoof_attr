@@ -271,8 +271,8 @@ def extract_model(
         layer_dir.mkdir(parents=True, exist_ok=True)
         saved = []
         for k in layer_keys:
-            # int keys -> zero-padded layer_06.npz; CNN-mode string keys
-            # (cnn_0/tf_0) are used verbatim -> layer_cnn_0.npz / layer_tf_0.npz.
+            # int keys -> zero-padded layer_06.npz. CNN mode also yields int
+            # keys 0..3 (last two conv + first two transformer), so it lands here.
             name = f"layer_{k:02d}" if isinstance(k, int) else f"layer_{k}"
             lp = layer_dir / f"{name}.npz"
             np.savez(lp, features=buffers[k][:w], layer=np.asarray(k),
@@ -332,11 +332,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--cnn-layers", action="store_true",
-        help="Extract every CNN feature-encoder layer (cnn_0..cnn_N) plus the "
-             "first three hidden states (tf_0/tf_1/tf_2 = input embedding + "
-             "transformer blocks 1-2) instead of all transformer layers. "
-             "transformers backend only (WavLM / HuBERT / wav2vec2). Output dir "
-             "gets a __cnn suffix.",
+        help="Extract the last two CNN feature-encoder layers plus the first "
+             "two transformer-encoder layers (saved as layer_00..layer_03: "
+             "00/01 = last two conv layers, 02/03 = transformer input embedding "
+             "+ block 1) instead of all transformer layers. transformers backend "
+             "only (WavLM / HuBERT / wav2vec2). Output dir gets a __cnn suffix.",
     )
     p.add_argument(
         "--pooling", choices=["mean", "max", "mean_std"], default="mean",

@@ -173,9 +173,9 @@ class BaseSERModel(ABC):
         self.name = name
         self.hf_id = hf_id
         self.device = device
-        # When True, ``forward_layers`` returns the CNN feature-encoder layer
-        # outputs plus the first two transformer blocks (transformers backend
-        # only; ignored by backends without an exposed conv encoder).
+        # When True, ``forward_layers`` returns the last two CNN feature-encoder
+        # layers plus the first two transformer-encoder layers (transformers
+        # backend only; ignored by backends without an exposed conv encoder).
         self.extract_cnn = extract_cnn
         self.model = None  # underlying nn.Module / FunASR AutoModel
         self.processor = None
@@ -204,9 +204,9 @@ class BaseSERModel(ABC):
         In the default mode keys are contiguous integers starting at 0 (``0`` is
         the encoder's input embedding, ``1..N`` the transformer block outputs).
         When ``extract_cnn`` is enabled the transformers backend instead returns
-        descriptive string keys -- ``cnn_0..cnn_N`` for the conv feature-encoder
-        layers and ``tf_0/tf_1/tf_2`` for the input embedding and first two
-        transformer blocks."""
+        the last two conv feature-encoder layers followed by the first two
+        transformer-encoder layers, re-keyed as integers ``0..3`` (``0/1`` =
+        ``cnn[-2]/cnn[-1]``, ``2/3`` = transformer input embedding + block 1)."""
 
     # -- fine-tuning helpers ----------------------------------------------- #
     def freeze(self) -> None:
@@ -286,16 +286,26 @@ class TransformersSERModel(BaseSERModel):
     @torch.no_grad()
     def _forward_cnn_layers(
         self, waveform: "torch.Tensor"
-    ) -> Dict[str, "torch.Tensor"]:
-        """Return every CNN conv-layer output plus the first two transformer
-        blocks.
+    ) -> Dict[int, "torch.Tensor"]:
+        """Return the last two CNN conv-layer outputs plus the first two
+        transformer-encoder layers, re-keyed as contiguous integers ``0..3``.
 
         Conv outputs are captured via forward hooks on
         ``feature_extractor.conv_layers`` (native shape ``(B, C, T)``) and
         transposed to time-major ``(T, C)`` so they share the transformer
-        ``(T, D)`` convention and flow through the same downstream pooling. Keys:
-        ``cnn_0..cnn_N`` for the conv layers, then ``tf_0`` (post-projection
-        input embedding) and ``tf_1``/``tf_2`` (first two transformer blocks).
+        ``(T, D)`` convention and flow through the same downstream pooling.
+
+        Integer keys (so the per-layer files are ``layer_00..layer_03`` and the
+        integer-only feature dataloader consumes them unchanged):
+
+            0 -> cnn[-2]  second-to-last conv feature-encoder layer  (512-d)
+            1 -> cnn[-1]  last conv feature-encoder layer             (512-d)
+            2 -> tf_0     transformer input embedding (hidden_states[0])
+            3 -> tf_1     first transformer block output (hidden_states[1])
+
+        The conv layers are 512-d while the transformer layers are the model
+        hidden size (768 base / 1024 large); each per-layer file is
+        self-contained, so the differing dim across layers is fine.
         """
         if self._conv_layers is None:
             raise RuntimeError(
@@ -327,15 +337,18 @@ class TransformersSERModel(BaseSERModel):
             for h in handles:
                 h.remove()
 
-        feats: Dict[str, "torch.Tensor"] = {}
-        # CNN conv layers: (B, C, T) -> (T, C).
-        for i in sorted(captured):
+        feats: Dict[int, "torch.Tensor"] = {}
+        out_idx = 0
+        # Last two conv feature-encoder layers: (B, C, T) -> (T, C).
+        for i in sorted(captured)[-2:]:
             conv = captured[i].squeeze(0)  # (C, T)
-            feats[f"cnn_{i}"] = conv.transpose(0, 1).contiguous().cpu()
-        # Transformer: input embedding (hidden_states[0]) + first two blocks.
+            feats[out_idx] = conv.transpose(0, 1).contiguous().cpu()
+            out_idx += 1
+        # First two transformer-encoder layers: input embedding + block 1.
         hidden_states = outputs.hidden_states
-        for j in range(min(3, len(hidden_states))):
-            feats[f"tf_{j}"] = hidden_states[j].squeeze(0).cpu()  # (T, D)
+        for j in range(min(2, len(hidden_states))):
+            feats[out_idx] = hidden_states[j].squeeze(0).cpu()  # (T, D)
+            out_idx += 1
         return feats
 
 
@@ -477,9 +490,10 @@ def load_model(
     backend:
         Required when ``name`` is unregistered and not transformers-based.
     extract_cnn:
-        When ``True``, ``forward_layers`` returns the CNN feature-encoder layer
-        outputs plus the first two transformer blocks instead of all transformer
-        layers. Supported by the ``transformers`` backend only.
+        When ``True``, ``forward_layers`` returns the last two CNN feature-encoder
+        layers plus the first two transformer-encoder layers (re-keyed 0..3)
+        instead of all transformer layers. Supported by the ``transformers``
+        backend only.
     """
     device = resolve_device(device)
     spec = MODEL_REGISTRY.get(name)

@@ -43,6 +43,7 @@ import torch.nn as nn
 
 from classifier_heads import HEADS, build_head
 from feature_dataset import (
+    BONAFIDE_INDEX,
     LayerData,
     balanced_class_weights,
     discover_model_dirs,
@@ -52,6 +53,13 @@ from feature_dataset import (
 )
 from model_loader import configure_logging
 from probe_metrics import evaluate, save_evaluation
+from protocols import (
+    PROTOCOL_FOLDS,
+    PROTOCOL_SUBSETS,
+    discover_feature_groups,
+    make_protocol_loaders,
+    protocol_layers,
+)
 
 logger = logging.getLogger("ser.train_probes")
 
@@ -83,7 +91,12 @@ def train_and_predict(
     seed: int,
 ) -> np.ndarray:
     """Train one head and return softmax probabilities on the eval split, in the
-    same order as ``data.y_test`` (eval loader is not shuffled)."""
+    same order as ``data.y_test`` (eval loader is not shuffled).
+
+    When ``data`` carries a protocol-defined ``val_loader`` (see
+    :class:`protocols.ProtocolData`), the epoch with the best validation accuracy
+    is restored before predicting the test set; otherwise the final-epoch model
+    is used (the single-subset :class:`~feature_dataset.LayerData` path)."""
     set_seed(seed)
     model = build_head(head_name, data.input_dim, data.num_classes, **head_cfg).to(device)
     criterion = nn.CrossEntropyLoss(
@@ -91,8 +104,11 @@ def train_and_predict(
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    model.train()
+    val_loader = getattr(data, "val_loader", None)
+    best_val, best_state = -1.0, None
+
     for epoch in range(epochs):
+        model.train()
         running, n = 0.0, 0
         for xb, yb in data.train_loader:
             xb, yb = xb.to(device), yb.to(device)
@@ -102,8 +118,19 @@ def train_and_predict(
             optimizer.step()
             running += loss.item() * xb.size(0)
             n += xb.size(0)
+        if val_loader is not None:
+            val_acc = _accuracy(model, val_loader, device)
+            if val_acc >= best_val:
+                best_val = val_acc
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("    %s epoch %d/%d  loss=%.4f", head_name, epoch + 1, epochs, running / n)
+            msg = "    %s epoch %d/%d  loss=%.4f" % (head_name, epoch + 1, epochs, running / n)
+            if val_loader is not None:
+                msg += "  val_acc=%.4f" % best_val
+            logger.debug(msg)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     model.eval()
     probs: List[np.ndarray] = []
@@ -114,25 +141,158 @@ def train_and_predict(
     return np.concatenate(probs, axis=0)
 
 
+def _accuracy(model: nn.Module, loader, device: str) -> float:
+    """Top-1 accuracy of ``model`` over a (non-shuffled) loader."""
+    model.eval()
+    correct, n = 0, 0
+    with torch.no_grad():
+        for xb, yb in loader:
+            pred = model(xb.to(device)).argmax(dim=1).cpu()
+            correct += int((pred == yb).sum())
+            n += yb.size(0)
+    return correct / max(n, 1)
+
+
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
+def _train_heads_on(
+    data,
+    model_tag: str,
+    layer: int,
+    *,
+    heads: Sequence[str],
+    head_cfg: Dict,
+    args: argparse.Namespace,
+    device: str,
+    results_dir: Path,
+    summary_rows: List[Dict],
+) -> None:
+    """Train every head on one (model, layer) ``data`` bundle, save per-head
+    metrics under ``results_dir/<model_tag>/<head>/layer_KK/`` and append summary
+    rows. Works for both :class:`feature_dataset.LayerData` and
+    :class:`protocols.ProtocolData` (the latter adds a val set + bonafide index)."""
+    class_weights = (
+        None if args.no_class_weight else balanced_class_weights(data.train_class_counts)
+    )
+    bonafide_index = getattr(data, "bonafide_index", BONAFIDE_INDEX)
+    for head_name in heads:
+        t0 = time.time()
+        probs = train_and_predict(
+            head_name, data,
+            epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+            device=device, class_weights=class_weights,
+            head_cfg=head_cfg, seed=args.seed,
+        )
+        metrics = evaluate(probs, data.y_test, data.class_names,
+                           bonafide_index=bonafide_index)
+        out_dir = results_dir / model_tag / head_name / f"layer_{layer:02d}"
+        save_evaluation(out_dir, metrics, data.class_names)
+
+        summary_rows.append({
+            "model": model_tag, "layer": layer, "head": head_name,
+            "n_train": len(data.y_train), "n_test": len(data.y_test),
+            "accuracy": metrics["accuracy"],
+            "binary_eer": metrics["binary_eer"],
+            "macro_ovr_eer": metrics["macro_ovr_eer"],
+        })
+        logger.info(
+            "  L%02d %-14s acc=%.4f  binEER=%.4f  macroEER=%.4f  (%.1fs)",
+            layer, head_name, metrics["accuracy"], metrics["binary_eer"],
+            metrics["macro_ovr_eer"], time.time() - t0,
+        )
+
+
+def _run_cv_layer(
+    protocol: str, feature_root: Path, model: str, pooling: str, cnn: bool,
+    layer: int, model_tag: str, *,
+    heads: Sequence[str], head_cfg: Dict, args: argparse.Namespace, device: str,
+    results_dir: Path, summary_rows: List[Dict], n_folds: int,
+) -> None:
+    """Cross-validation for one (model, layer): train every head on every fold,
+    save each fold's metrics under ``.../layer_KK/fold_F/``, then write a
+    ``cv_metrics.json`` (mean +/- std + per-fold) per head and a mean summary row."""
+    per_head: Dict[str, Dict[str, List[float]]] = {
+        h: {"accuracy": [], "binary_eer": [], "macro_ovr_eer": []} for h in heads
+    }
+    n_train = n_test = 0
+    for fold in range(n_folds):
+        data = make_protocol_loaders(
+            feature_root, protocol, model=model, pooling=pooling, layer=layer,
+            cnn=cnn, fold=fold, n_folds=n_folds, batch_size=args.batch_size,
+            seed=args.seed, standardize=not args.no_standardize,
+            num_workers=args.num_workers, device=device,
+        )
+        n_train, n_test = len(data.y_train), len(data.y_test)
+        class_weights = (
+            None if args.no_class_weight else balanced_class_weights(data.train_class_counts)
+        )
+        for head_name in heads:
+            t0 = time.time()
+            probs = train_and_predict(
+                head_name, data,
+                epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+                device=device, class_weights=class_weights,
+                head_cfg=head_cfg, seed=args.seed,
+            )
+            metrics = evaluate(probs, data.y_test, data.class_names,
+                               bonafide_index=data.bonafide_index)
+            out_dir = results_dir / model_tag / head_name / f"layer_{layer:02d}" / f"fold_{fold}"
+            save_evaluation(out_dir, metrics, data.class_names)
+            for key in per_head[head_name]:
+                per_head[head_name][key].append(metrics[key])
+            logger.info(
+                "  L%02d %-14s fold %d/%d acc=%.4f  (%.1fs)",
+                layer, head_name, fold + 1, n_folds, metrics["accuracy"], time.time() - t0,
+            )
+
+    for head_name in heads:
+        vals = {k: np.asarray(v, dtype=float) for k, v in per_head[head_name].items()}
+        agg = {"n_folds": n_folds}
+        for k, v in vals.items():
+            agg[f"{k}_mean"] = float(np.nanmean(v))
+            agg[f"{k}_std"] = float(np.nanstd(v))
+            agg[f"per_fold_{k}"] = v.tolist()
+        out_dir = results_dir / model_tag / head_name / f"layer_{layer:02d}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "cv_metrics.json").write_text(json.dumps(agg, indent=2), encoding="utf-8")
+
+        summary_rows.append({
+            "model": model_tag, "layer": layer, "head": head_name,
+            "n_train": n_train, "n_test": n_test,
+            "accuracy": agg["accuracy_mean"],
+            "binary_eer": agg["binary_eer_mean"],
+            "macro_ovr_eer": agg["macro_ovr_eer_mean"],
+        })
+        logger.info(
+            "  L%02d %-14s CV%d acc=%.4f+/-%.4f  binEER=%.4f+/-%.4f  macroEER=%.4f+/-%.4f",
+            layer, head_name, n_folds,
+            agg["accuracy_mean"], agg["accuracy_std"],
+            agg["binary_eer_mean"], agg["binary_eer_std"],
+            agg["macro_ovr_eer_mean"], agg["macro_ovr_eer_std"],
+        )
+
+
 def run(args: argparse.Namespace) -> int:
     device = resolve_device(args.device)
     logger.info("Device: %s", device)
 
     feature_root = Path(args.features_dir)
+    heads = args.heads or list(HEADS)
+    head_cfg = dict(
+        d_model=args.d_model, d_state=args.d_state,
+        n_layers=args.n_layers, n_heads=args.n_heads, dropout=args.dropout,
+    )
+
+    if args.protocol:
+        return _run_protocol(args, device, feature_root, heads, head_cfg)
+
     model_dirs = discover_model_dirs(feature_root, args.models)
     if not model_dirs:
         logger.error("No per-layer feature dirs under %s (filter=%s).",
                      feature_root, args.models)
         return 2
 
-    heads = args.heads or list(HEADS)
-    head_cfg = dict(
-        d_model=args.d_model, d_state=args.d_state,
-        n_layers=args.n_layers, n_heads=args.n_heads, dropout=args.dropout,
-    )
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     (results_dir / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
@@ -152,38 +312,80 @@ def run(args: argparse.Namespace) -> int:
                 seed=args.seed, standardize=not args.no_standardize,
                 num_workers=args.num_workers, device=device,
             )
-            class_weights = (
-                None if args.no_class_weight
-                else balanced_class_weights(data.train_class_counts)
+            _train_heads_on(
+                data, model_key, layer, heads=heads, head_cfg=head_cfg, args=args,
+                device=device, results_dir=results_dir, summary_rows=summary_rows,
             )
-            for head_name in heads:
-                t0 = time.time()
-                probs = train_and_predict(
-                    head_name, data,
-                    epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
-                    device=device, class_weights=class_weights,
-                    head_cfg=head_cfg, seed=args.seed,
-                )
-                metrics = evaluate(probs, data.y_test, data.class_names)
-                out_dir = results_dir / model_key / head_name / f"layer_{layer:02d}"
-                save_evaluation(out_dir, metrics, data.class_names)
-
-                summary_rows.append({
-                    "model": model_key, "layer": layer, "head": head_name,
-                    "n_train": len(data.y_train), "n_test": len(data.y_test),
-                    "accuracy": metrics["accuracy"],
-                    "binary_eer": metrics["binary_eer"],
-                    "macro_ovr_eer": metrics["macro_ovr_eer"],
-                })
-                logger.info(
-                    "  L%02d %-14s acc=%.4f  binEER=%.4f  macroEER=%.4f  (%.1fs)",
-                    layer, head_name, metrics["accuracy"], metrics["binary_eer"],
-                    metrics["macro_ovr_eer"], time.time() - t0,
-                )
 
     write_summary(results_dir / "summary.csv", summary_rows)
     logger.info("Done: %d runs in %.1f min -> %s",
                 len(summary_rows), (time.time() - t_start) / 60.0, results_dir)
+    return 0
+
+
+def _run_protocol(
+    args: argparse.Namespace, device: str, feature_root: Path,
+    heads: Sequence[str], head_cfg: Dict,
+) -> int:
+    """Protocol mode: build train/val/test per :mod:`protocols` and write results
+    under ``<results-dir>/<protocol>/<model>[__cnn]/<head>/layer_KK/``."""
+    protocol = args.protocol
+    groups = discover_feature_groups(feature_root, args.models)
+    if not groups:
+        logger.error("No feature dirs under %s (filter=%s).", feature_root, args.models)
+        return 2
+
+    results_dir = Path(args.results_dir) / protocol
+    results_dir.mkdir(parents=True, exist_ok=True)
+    (results_dir / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+
+    summary_rows: List[Dict] = []
+    t_start = time.time()
+
+    for (model, pooling, cnn), subset_layers in groups.items():
+        avail = protocol_layers(subset_layers, protocol)
+        if not avail:
+            logger.warning(
+                "[%s] skipping %s (%s%s): need subsets %s, have %s.",
+                protocol, model, pooling, ", cnn" if cnn else "",
+                PROTOCOL_SUBSETS[protocol], sorted(subset_layers),
+            )
+            continue
+        layers = ([l for l in args.layers if l in avail]
+                  if args.layers is not None else avail)
+        if not layers:
+            continue
+        model_tag = f"{model}__cnn" if cnn else model
+        logger.info("=== [%s] %s (%s%s): layers %s x heads %s ===",
+                    protocol, model, pooling, ", cnn" if cnn else "", layers, heads)
+        for layer in layers:
+            if protocol in PROTOCOL_FOLDS:
+                _run_cv_layer(
+                    protocol, feature_root, model, pooling, cnn, layer, model_tag,
+                    heads=heads, head_cfg=head_cfg, args=args, device=device,
+                    results_dir=results_dir, summary_rows=summary_rows,
+                    n_folds=args.cv_folds,
+                )
+                continue
+            data = make_protocol_loaders(
+                feature_root, protocol, model=model, pooling=pooling, layer=layer,
+                cnn=cnn, batch_size=args.batch_size, seed=args.seed,
+                standardize=not args.no_standardize, num_workers=args.num_workers,
+                device=device,
+            )
+            _train_heads_on(
+                data, model_tag, layer, heads=heads, head_cfg=head_cfg, args=args,
+                device=device, results_dir=results_dir, summary_rows=summary_rows,
+            )
+
+    if not summary_rows:
+        logger.error("No runnable feature groups for protocol '%s' under %s "
+                     "(are the required subsets extracted?).", protocol, feature_root)
+        return 2
+
+    write_summary(results_dir / "summary.csv", summary_rows)
+    logger.info("Done [%s]: %d runs in %.1f min -> %s",
+                protocol, len(summary_rows), (time.time() - t_start) / 60.0, results_dir)
     return 0
 
 
@@ -212,6 +414,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--features-dir", default="feats_test",
                    help="Root holding per-layer feature dirs (read-only).")
+    p.add_argument("--protocol", choices=sorted(PROTOCOL_SUBSETS), default=None,
+                   help="Custom train/val/test protocol (csr1|csr2|attr2|attr17|cv5). "
+                        "Builds splits across subsets via protocols.py and writes "
+                        "results under <results-dir>/<protocol>/. Omit for the "
+                        "default single-subset stratified split. --test-size is "
+                        "ignored in protocol mode (splits are protocol-defined).")
+    p.add_argument("--cv-folds", type=int, default=5,
+                   help="Number of folds for cross-validation protocols (cv5). "
+                        "Ignored by single-split protocols.")
     p.add_argument("--models", nargs="+", default=None,
                    help="Filter model dirs by substring (default: all found).")
     p.add_argument("--layers", nargs="+", type=int, default=None,

@@ -20,7 +20,7 @@ import csv
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -59,17 +59,30 @@ def compute_eer(scores: np.ndarray, labels: np.ndarray):
     return float((fpr[i] + fnr[i]) / 2.0), float(thr[i])
 
 
-def evaluate(probs: np.ndarray, y_true: np.ndarray, class_names: List[str]) -> Dict:
-    """Compute the full metric bundle for one (model, layer, head)."""
+def evaluate(
+    probs: np.ndarray,
+    y_true: np.ndarray,
+    class_names: List[str],
+    bonafide_index: Optional[int] = BONAFIDE_INDEX,
+) -> Dict:
+    """Compute the full metric bundle for one (model, layer, head).
+
+    ``bonafide_index`` is the column of the bonafide class for the binary
+    bonafide-vs-spoof EER; pass ``None`` for label spaces with no bonafide class
+    (e.g. the attr17 protocol), in which case ``binary_eer`` is reported as NaN.
+    """
     num = len(class_names)
     y_pred = probs.argmax(axis=1)
     cm = confusion(y_true, y_pred, num)
     pca = per_class_accuracy(cm)
 
     # Binary bonafide-vs-spoof EER: score = P(spoof) = 1 - P(bonafide).
-    spoof_score = 1.0 - probs[:, BONAFIDE_INDEX]
-    spoof_label = (y_true != BONAFIDE_INDEX).astype(int)
-    binary_eer, _ = compute_eer(spoof_score, spoof_label)
+    if bonafide_index is not None and 0 <= bonafide_index < num:
+        spoof_score = 1.0 - probs[:, bonafide_index]
+        spoof_label = (y_true != bonafide_index).astype(int)
+        binary_eer, _ = compute_eer(spoof_score, spoof_label)
+    else:
+        binary_eer = float("nan")
 
     # Macro one-vs-rest EER.
     ovr = {
