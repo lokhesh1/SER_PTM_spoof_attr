@@ -14,12 +14,13 @@ The four protocols (ASVspoof2019 LA; train/dev = A01-A06, eval = A07-A19, and
 A16/A19 reuse the A04/A06 algorithms):
 
 * ``csr1``  -- 7 classes (bonafide + A01-A06). train = 80% of orig train,
-  val = 20% of orig train (speaker-disjoint), test = entire orig dev.
+  val = 20% of orig train (stratified random split, speakers may overlap),
+  test = entire orig dev.
 * ``csr2``  -- 14 classes (bonafide + A07-A19). orig eval split 60:20:20
-  (speaker-disjoint) into train/val/test.
-* ``attr2`` -- closed-set, 7-class space (bonafide + A01-A06). train = orig
-  train, val = orig dev, test = orig eval restricted to the two *known* attacks
-  A16->A04 and A19->A06 (no bonafide). Original partitions otherwise.
+  (stratified random split, speakers may overlap) into train/val/test.
+* ``attr2`` -- closed-set, 6-class space (A01-A06, **no bonafide**). train =
+  orig train, val = orig dev (both bonafide-filtered), test = orig eval
+  restricted to the two *known* attacks A16->A04 and A19->A06.
 * ``attr17``-- 17 classes, **no bonafide** (A01-A15, A17, A18; A16->A04,
   A19->A06 merged). A01-A06: orig train split 80:20 (train/val), orig dev = test.
   A07-A19 (from orig eval): 39 "speaker-common" speakers split 50:10:40 across
@@ -72,7 +73,7 @@ KNOWN_ATTACK_MERGE: Dict[str, str] = {"A16": "A04", "A19": "A06"}
 
 CSR1_CLASSES: List[str] = ["bonafide", *_A(1, 2, 3, 4, 5, 6)]                       # 7
 CSR2_CLASSES: List[str] = ["bonafide", *_A(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)]  # 14
-ATTR2_CLASSES: List[str] = ["bonafide", *_A(1, 2, 3, 4, 5, 6)]                      # 7 (test: A04/A06 only)
+ATTR2_CLASSES: List[str] = _A(1, 2, 3, 4, 5, 6)                                    # 6, no bonafide (test: A04/A06 only)
 ATTR17_CLASSES: List[str] = _A(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18)  # 17, no bonafide
 # cv5: merge train+dev+eval; full set = bonafide + all 19 attack ids kept
 # distinct (A16/A19 NOT merged). 20 classes.
@@ -85,7 +86,7 @@ PROTOCOL_CLASSES: Dict[str, List[str]] = {
 # Index of the bonafide class, or None when the protocol has no bonafide class
 # (controls whether a binary bonafide-vs-spoof EER is meaningful downstream).
 PROTOCOL_BONAFIDE: Dict[str, Optional[int]] = {
-    "csr1": 0, "csr2": 0, "attr2": 0, "attr17": None, "cv5": 0,
+    "csr1": 0, "csr2": 0, "attr2": None, "attr17": None, "cv5": 0,
 }
 # Original subsets each protocol needs features extracted for.
 PROTOCOL_SUBSETS: Dict[str, List[str]] = {
@@ -217,6 +218,38 @@ def speaker_disjoint_split(
     return [np.asarray(b, dtype=int) for b in buckets]
 
 
+def random_split(
+    labels: np.ndarray,
+    fractions: Sequence[float],
+    seed: int,
+) -> List[np.ndarray]:
+    """Partition utterance indices into ``len(fractions)`` buckets with a
+    *stratified* random split: within each class the indices are shuffled and
+    sliced by the cumulative fractions, so every bucket keeps (approximately) the
+    same per-class proportions. Speakers are ignored, so the same speaker may
+    appear in more than one bucket (NOT speaker-disjoint).
+
+    Returns one ``int`` index array per bucket, in ``fractions`` order.
+    """
+    k = len(fractions)
+    fr = np.asarray(fractions, dtype=float)
+    fr = fr / fr.sum()
+    rng = np.random.default_rng(seed)
+    labels = np.asarray(labels)
+    buckets: List[List[int]] = [[] for _ in range(k)]
+    for cls in np.unique(labels):
+        idx = np.where(labels == cls)[0]
+        rng.shuffle(idx)
+        n = len(idx)
+        cuts = np.floor(np.cumsum(fr) * n).astype(int)
+        prev = 0
+        for b in range(k):
+            end = n if b == k - 1 else int(cuts[b])
+            buckets[b].extend(idx[prev:end].tolist())
+            prev = end
+    return [np.asarray(sorted(b), dtype=int) for b in buckets]
+
+
 def _select_disjoint_speakers(speakers: np.ndarray, seed: int) -> List[str]:
     """Choose the attr17 speaker-disjoint (eval-only) speaker ids."""
     uniq = np.unique(speakers).tolist()
@@ -281,7 +314,7 @@ def _merge_known(attacks: np.ndarray) -> np.ndarray:
 def _build_csr1(root, model, pooling, cnn, layer, seed) -> Split:
     tr = _load_subset(root, "train", model, pooling, cnn, layer)
     dev = _load_subset(root, "dev", model, pooling, cnn, layer)
-    b_tr, b_val = speaker_disjoint_split(tr.speakers, [0.8, 0.2], seed)
+    b_tr, b_val = random_split(tr.attacks, [0.8, 0.2], seed)
     return {
         "train": (tr.X[b_tr], tr.attacks[b_tr]),
         "val": (tr.X[b_val], tr.attacks[b_val]),
@@ -291,7 +324,7 @@ def _build_csr1(root, model, pooling, cnn, layer, seed) -> Split:
 
 def _build_csr2(root, model, pooling, cnn, layer, seed) -> Split:
     ev = _load_subset(root, "eval", model, pooling, cnn, layer)
-    b_tr, b_val, b_te = speaker_disjoint_split(ev.speakers, [0.6, 0.2, 0.2], seed)
+    b_tr, b_val, b_te = random_split(ev.attacks, [0.6, 0.2, 0.2], seed)
     return {
         "train": (ev.X[b_tr], ev.attacks[b_tr]),
         "val": (ev.X[b_val], ev.attacks[b_val]),
@@ -304,12 +337,15 @@ def _build_attr2(root, model, pooling, cnn, layer, seed) -> Split:
     tr = _load_subset(root, "train", model, pooling, cnn, layer)
     dev = _load_subset(root, "dev", model, pooling, cnn, layer)
     ev = _load_subset(root, "eval", model, pooling, cnn, layer)
-    # Closed-set test: only the two known attacks, relabeled to A04/A06, no bonafide.
-    mask = np.isin(ev.attacks, list(KNOWN_ATTACK_MERGE))  # A16, A19
+    # No bonafide anywhere: train/val are A01-A06 only; closed-set test is the two
+    # known attacks A16/A19 relabeled to A04/A06.
+    tr_mask = tr.attacks != "bonafide"
+    dev_mask = dev.attacks != "bonafide"
+    test_mask = np.isin(ev.attacks, list(KNOWN_ATTACK_MERGE))  # A16, A19
     return {
-        "train": (tr.X, tr.attacks),   # full bonafide + A01-A06
-        "val": (dev.X, dev.attacks),
-        "test": (ev.X[mask], _merge_known(ev.attacks[mask])),
+        "train": (tr.X[tr_mask], tr.attacks[tr_mask]),   # A01-A06
+        "val": (dev.X[dev_mask], dev.attacks[dev_mask]),
+        "test": (ev.X[test_mask], _merge_known(ev.attacks[test_mask])),
     }
 
 
