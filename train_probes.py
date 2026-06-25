@@ -60,6 +60,12 @@ from protocols import (
     make_protocol_loaders,
     protocol_layers,
 )
+from protocols_mlaad import (
+    MLAAD_ROOT_DEFAULT,
+    build_ratio_split,
+    load_manifest,
+    make_mlaad_loaders,
+)
 
 logger = logging.getLogger("ser.train_probes")
 
@@ -284,6 +290,9 @@ def run(args: argparse.Namespace) -> int:
         n_layers=args.n_layers, n_heads=args.n_heads, dropout=args.dropout,
     )
 
+    if args.mlaad:
+        return _run_mlaad(args, device, feature_root, heads, head_cfg)
+
     if args.protocol:
         return _run_protocol(args, device, feature_root, heads, head_cfg)
 
@@ -389,6 +398,76 @@ def _run_protocol(
     return 0
 
 
+def _parse_mlaad_dir(name: str) -> Optional[tuple]:
+    """``feat_hubert_emotion_00`` -> ``("hubert_emotion", 0)``; ``None`` if the
+    directory name isn't a ``feat_<encoder>_<layer>`` feature tree."""
+    if not name.startswith("feat_"):
+        return None
+    encoder, _, suffix = name[len("feat_"):].rpartition("_")
+    if not encoder or not suffix.isdigit():
+        return None
+    return encoder, int(suffix)
+
+
+def _run_mlaad(
+    args: argparse.Namespace, device: str, feature_root: Path,
+    heads: Sequence[str], head_cfg: Dict,
+) -> int:
+    """MLAAD mode: closed-set source-tracing (82 generators) over the ratio split
+    in :mod:`protocols_mlaad`. Each ``feat_<encoder>_<layer>/`` dir under
+    ``--features-dir`` is one layer; the existing per-head training/eval path is
+    reused unchanged. Results land under ``<results-dir>/mlaad/<encoder>/<head>/
+    layer_KK/``."""
+    if args.mlaad_manifest:
+        split = load_manifest(args.mlaad_manifest)
+        logger.info("MLAAD split loaded from manifest %s (%d clips).",
+                    args.mlaad_manifest, len(split.rel_paths))
+    else:
+        split = build_ratio_split(args.mlaad_root, seed=args.seed)
+        logger.info("MLAAD split built fresh (seed %d) from %s.", args.seed, args.mlaad_root)
+
+    layer_dirs = sorted(d for d in feature_root.glob("feat_*_*") if d.is_dir())
+    if args.models:
+        layer_dirs = [d for d in layer_dirs if any(m in d.name for m in args.models)]
+    if not layer_dirs:
+        logger.error("No feat_<encoder>_<layer>/ dirs under %s (filter=%s). "
+                     "Run extract_mlaad.py first.", feature_root, args.models)
+        return 2
+
+    results_dir = Path(args.results_dir) / "mlaad"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    (results_dir / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+
+    summary_rows: List[Dict] = []
+    t_start = time.time()
+    for layer_dir in layer_dirs:
+        parsed = _parse_mlaad_dir(layer_dir.name)
+        if parsed is None:
+            logger.warning("Skipping unrecognized dir name: %s", layer_dir.name)
+            continue
+        encoder, layer = parsed
+        if args.layers is not None and layer not in args.layers:
+            continue
+        logger.info("=== [mlaad] %s layer %02d x heads %s ===", encoder, layer, heads)
+        data = make_mlaad_loaders(
+            layer_dir, split, batch_size=args.batch_size,
+            standardize=not args.no_standardize, num_workers=args.num_workers,
+            device=device,
+        )
+        _train_heads_on(
+            data, encoder, layer, heads=heads, head_cfg=head_cfg, args=args,
+            device=device, results_dir=results_dir, summary_rows=summary_rows,
+        )
+
+    if not summary_rows:
+        logger.error("No runnable MLAAD layer dirs under %s.", feature_root)
+        return 2
+    write_summary(results_dir / "summary.csv", summary_rows)
+    logger.info("Done [mlaad]: %d runs in %.1f min -> %s",
+                len(summary_rows), (time.time() - t_start) / 60.0, results_dir)
+    return 0
+
+
 def write_summary(path: Path, rows: List[Dict]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         wr = csv.DictWriter(fh, fieldnames=SUMMARY_COLUMNS)
@@ -423,6 +502,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cv-folds", type=int, default=5,
                    help="Number of folds for cross-validation protocols (cv5). "
                         "Ignored by single-split protocols.")
+    p.add_argument("--mlaad", action="store_true",
+                   help="MLAAD source-tracing mode: closed-set 82-class attribution "
+                        "over the protocols_mlaad ratio split (seed via --seed). "
+                        "--features-dir must hold the feat_<encoder>_<layer>/ trees "
+                        "from extract_mlaad.py; results go to <results-dir>/mlaad/. "
+                        "Ignores --protocol/--test-size.")
+    p.add_argument("--mlaad-manifest", default=None,
+                   help="MLAAD split manifest CSV (protocols_mlaad --write-manifest). "
+                        "If omitted, the split is rebuilt from --mlaad-root with --seed.")
+    p.add_argument("--mlaad-root", default=str(MLAAD_ROOT_DEFAULT),
+                   help="MLAAD v5 root, used to rebuild the split when no manifest given.")
     p.add_argument("--models", nargs="+", default=None,
                    help="Filter model dirs by substring (default: all found).")
     p.add_argument("--layers", nargs="+", type=int, default=None,
