@@ -105,13 +105,15 @@ class FeatureResult:
 
     model_name: str
     source: str  # file path, or "<array>" for in-memory audio
-    features: Dict[int, np.ndarray]  # layer index -> (T, D) or (D,) if pooled
+    # layer key -> (T, D) or (D,) if pooled. Keys are ints in the default mode,
+    # or strings ("cnn_*"/"tf_*") when the model runs with extract_cnn enabled.
+    features: Dict[Union[int, str], np.ndarray]
     pooled: bool
     sample_rate: int
     saved_to: Optional[str] = None
 
     @property
-    def final_layer(self) -> int:
+    def final_layer(self) -> Union[int, str]:
         return max(self.features)
 
 
@@ -176,13 +178,18 @@ def pool_over_time(feat: "torch.Tensor", method: str) -> "torch.Tensor":
 
 
 def select_layers(
-    feats: Dict[int, "torch.Tensor"], layers: Optional[Sequence[int]]
-) -> Dict[int, "torch.Tensor"]:
-    """Pick the requested layers, resolving negative indices."""
+    feats: Dict[Union[int, str], "torch.Tensor"], layers: Optional[Sequence[int]]
+) -> Dict[Union[int, str], "torch.Tensor"]:
+    """Pick the requested layers, resolving negative indices.
+
+    Integer ``--layers`` selection targets the default integer-keyed layers; the
+    string-keyed CNN mode (``cnn_*``/``tf_*``) is intended to be consumed whole,
+    so pass ``layers=None`` (the default / ``all``) there.
+    """
     if layers is None:
         return dict(feats)
     n = len(feats)
-    selected: Dict[int, "torch.Tensor"] = {}
+    selected: Dict[Union[int, str], "torch.Tensor"] = {}
     for layer in layers:
         idx = layer if layer >= 0 else n + layer
         if idx not in feats:
@@ -246,7 +253,7 @@ def extract_features(
             f"available 0..{len(all_layers) - 1}."
         )
 
-    features: Dict[int, np.ndarray] = {}
+    features: Dict[Union[int, str], np.ndarray] = {}
     for idx, feat in chosen.items():
         if config.pooling is not None:
             feat = pool_over_time(feat, config.pooling)
@@ -318,6 +325,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--audio", nargs="+", help="Audio file(s) to process.")
     p.add_argument("--layers", nargs="+",
                    help="Layer indices (e.g. 6 9 12 or -1) or 'all'. Default: all.")
+    p.add_argument("--cnn-layers", action="store_true",
+                   help="Extract every CNN feature-encoder layer plus the first "
+                        "two transformer blocks (transformers backend only). "
+                        "Yields cnn_*/tf_* keyed features; use with 'all' layers.")
     p.add_argument("--pooling", choices=["mean", "max", "mean_std"],
                    help="Temporal pooling; omit to keep the full (T, D) sequence.")
     p.add_argument("--save", action="store_true", help="Save extracted features.")
@@ -338,7 +349,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     model_key = args.model or _prompt_for_model()
     model = load_model(
-        model_key, device=args.device, hf_id=args.hf_id, backend=args.backend
+        model_key, device=args.device, hf_id=args.hf_id, backend=args.backend,
+        extract_cnn=args.cnn_layers,
     )
 
     if not args.audio:
