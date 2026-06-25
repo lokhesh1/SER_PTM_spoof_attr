@@ -280,8 +280,15 @@ def make_mlaad_loaders(
         return X, y
 
     X_tr, y_tr = _xy("train")
-    X_val, y_val = _xy("val")
-    X_te, y_te = _xy("test")
+    if X_tr.size == 0:
+        raise ValueError(f"{feature_dir.name}: empty train split -- nothing to fit on.")
+    dim = X_tr.shape[1]
+
+    def _as2d(X: np.ndarray) -> np.ndarray:  # empty splits come back (0,); make (0, D)
+        return X if X.size else np.zeros((0, dim), dtype=np.float32)
+
+    X_val, y_val = _xy("val"); X_val = _as2d(X_val)
+    X_te, y_te = _xy("test"); X_te = _as2d(X_te)
 
     stats = None
     if standardize:
